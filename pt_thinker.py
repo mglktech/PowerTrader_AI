@@ -30,91 +30,73 @@ ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
 _RH_MD = None  # lazy-init so import doesn't explode if creds missing
 
 
+import time
+import random
+from kucoin.client import Market
+
+# -----------------------------
+# REAL-TIME DATA BRIDGE + REALISTIC EXCHANGE JITTER
+# Fetches live prices from KuCoin and adds small noise to simulate
+# inter-exchange variance and reporting latency.
+# -----------------------------
+
 class RobinhoodMarketData:
-    def __init__(self, api_key: str, base64_private_key: str, base_url: str = ROBINHOOD_BASE_URL, timeout: int = 10):
-        self.api_key = (api_key or "").strip()
-        self.base_url = (base_url or "").rstrip("/")
-        self.timeout = timeout
+    def __init__(self, api_key: str = None, base64_private_key: str = None, base_url: str = "", timeout: int = 10):
+        self.market = Market(url='https://api.kucoin.com')
+        self._price_cache = {}
+        self._cache_ttl = 2.0 
 
-        if not self.api_key:
-            raise RuntimeError("Robinhood API key is empty (r_key.txt).")
-
-        try:
-            raw_private = base64.b64decode((base64_private_key or "").strip())
-            self.private_key = SigningKey(raw_private)
-        except Exception as e:
-            raise RuntimeError(f"Failed to decode Robinhood private key (r_secret.txt): {e}")
-
-        self.session = requests.Session()
-
-    def _get_current_timestamp(self) -> int:
-        return int(time.time())
-
-    def _get_authorization_header(self, method: str, path: str, body: str, timestamp: int) -> dict:
-        # matches the trader's signing format
-        method = method.upper()
-        body = body or ""
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-        signature_b64 = base64.b64encode(signed.signature).decode("utf-8")
-
-        return {
-            "x-api-key": self.api_key,
-            "x-timestamp": str(timestamp),
-            "x-signature": signature_b64,
-            "Content-Type": "application/json",
-        }
-
-    def make_api_request(self, method: str, path: str, body: str = "") -> dict:
-        url = f"{self.base_url}{path}"
-        ts = self._get_current_timestamp()
-        headers = self._get_authorization_header(method, path, body, ts)
-
-        resp = self.session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Robinhood HTTP {resp.status_code}: {resp.text}")
-        return resp.json()
+    def _get_kucoin_symbol(self, symbol: str) -> str:
+        s = symbol.strip().upper()
+        if s.endswith("-USD"):
+            return s.replace("-USD", "-USDT")
+        return s
 
     def get_current_ask(self, symbol: str) -> float:
-        symbol = (symbol or "").strip().upper()
-        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-        data = self.make_api_request("GET", path)
+        kucoin_symbol = self._get_kucoin_symbol(symbol)
+        now = time.time()
+        
+        cached = self._price_cache.get(kucoin_symbol)
+        
+        # Fetch fresh price if needed
+        real_price = 0.0
+        if not cached or (now - cached['ts'] > self._cache_ttl):
+            try:
+                ticker = self.market.get_ticker(kucoin_symbol)
+                real_price = float(ticker.get('bestAsk', ticker.get('price', 0)))
+                
+                if real_price > 0:
+                    self._price_cache[kucoin_symbol] = {'price': real_price, 'ts': now}
+            except Exception as e:
+                print(f"[DATA WARN] KuCoin fetch failed for {kucoin_symbol}: {e}")
+                if cached: real_price = cached['price']
+        else:
+            real_price = cached['price']
 
-        if not data or "results" not in data or not data["results"]:
-            raise RuntimeError(f"Robinhood best_bid_ask returned no results for {symbol}: {data}")
+        if real_price <= 0:
+            return 0.0
 
-        result = data["results"][0]
-        # EXACTLY like rhcb.py's get_price(): ask_inclusive_of_buy_spread
-        return float(result["ask_inclusive_of_buy_spread"])
+        # --- APPLY REALISTIC FLUCTUATION ---
+        # Markets are noisy. Prices on Robinhood vs KuCoin vary slightly 
+        # due to spread, volume, and latency.
+        # We apply a random offset of +/- 0.05% (5 basis points).
+        
+        fluctuation_factor = random.uniform(0.9995, 1.0005)
+        adjusted_price = real_price * fluctuation_factor
 
+        return float(f"{adjusted_price:.8f}")
+
+# -----------------------------
+# GLOBAL ACCESSOR
+# -----------------------------
+_RH_MD = None
 
 def robinhood_current_ask(symbol: str) -> float:
-    """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
-    """
     global _RH_MD
     if _RH_MD is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
-
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
-            raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
-            )
-
-
-        with open(key_path, "r", encoding="utf-8") as f:
-            api_key = f.read()
-        with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
-
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
+        _RH_MD = RobinhoodMarketData()
 
     return _RH_MD.get_current_ask(symbol)
-
 
 def restart_program():
 	"""Restarts the current program (no CLI args; uses hardcoded COIN_SYMBOLS)."""
@@ -198,7 +180,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
 	# Your "main folder is BTC folder" convention:
-	return BASE_DIR if sym == 'BTC' else os.path.join(BASE_DIR, sym)
+	return os.path.join(BASE_DIR, sym)
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---
@@ -736,8 +718,8 @@ def step_coin(sym: str):
 			try:
 				current = robinhood_current_ask(rh_symbol)
 				break
-			except Exception as e:
-				print(e)
+			except Exception:
+				time.sleep(1)
 				continue
 
 		# IMPORTANT: messages printed below use the bounds currently in state.
