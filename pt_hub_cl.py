@@ -114,7 +114,7 @@ class WrapFrame(ttk.Frame):
 
 class NeuralSignalTile(ttk.Frame):
 
-    def __init__(self, parent: tk.Widget, coin: str, bar_height: int = 52, levels: int = 8):
+    def __init__(self, parent: tk.Widget, coin: str, bar_height: int = 52, levels: int = 8, trade_start_level: int = 3):
         super().__init__(parent)
         self.coin = coin
 
@@ -186,10 +186,14 @@ class NeuralSignalTile(ttk.Frame):
                 )
             )
 
-        # Marker line after the 2nd block (between 2 and 3) -- LONG side only.
-        # With display_levels=7, "after 2nd block" means boundary after seg index 1.
-        trade_y = int(round(yb - (2 * self._bar_h / self._display_levels)))
-        self.canvas.create_line(x0, trade_y, x1, trade_y, fill=DARK_FG, width=2)
+        # Trade-start marker line (boundary before the trade-start level).
+        # Example: trade_start_level=3 => line after 2nd block (between 2 and 3).
+        self._trade_line_geom = (x0, x1, x2, x3, yb)
+        self._trade_line_long = self.canvas.create_line(x0, yb, x1, yb, fill=DARK_FG, width=2)
+        self._trade_line_short = self.canvas.create_line(x2, yb, x3, yb, fill=DARK_FG, width=2)
+        self._trade_start_level = 3
+        self.set_trade_start_level(trade_start_level)
+
 
         self.value_lbl = ttk.Label(self, text="L:0 S:0")
         self.value_lbl.pack(anchor="center", pady=(1, 0))
@@ -221,6 +225,35 @@ class NeuralSignalTile(ttk.Frame):
                 self.value_lbl.configure(foreground=self._normal_fg)
         except Exception:
             pass
+
+    def set_trade_start_level(self, level: Any) -> None:
+        """Move the marker line to the boundary before the chosen start level."""
+        self._trade_start_level = self._clamp_trade_start_level(level)
+        self._update_trade_lines()
+
+    def _clamp_trade_start_level(self, value: Any) -> int:
+        try:
+            v = int(float(value))
+        except Exception:
+            v = 3
+        # Trade starts at levels 1..display_levels (usually 1..7)
+        return max(1, min(v, self._display_levels))
+
+    def _update_trade_lines(self) -> None:
+        try:
+            x0, x1, x2, x3, yb = self._trade_line_geom
+        except Exception:
+            return
+
+        k = max(0, min(int(self._trade_start_level) - 1, self._display_levels))
+        y = int(round(yb - (k * self._bar_h / self._display_levels)))
+
+        try:
+            self.canvas.coords(self._trade_line_long, x0, y, x1, y)
+            self.canvas.coords(self._trade_line_short, x2, y, x3, y)
+        except Exception:
+            pass
+
 
 
     def _clamp_level(self, value: Any) -> int:
@@ -271,8 +304,20 @@ class NeuralSignalTile(ttk.Frame):
 # -----------------------------
 
 DEFAULT_SETTINGS = {
-    "main_neural_dir": r"C:\PowerTrader_AI",
+    "main_neural_dir": "",
+    "coin_data_dir": "coin_data",
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
+    "trade_start_level": 3,  # trade starts when long signal >= this level (1..7)
+    "start_allocation_pct": 0.005,  # % of total account value for initial entry (min $0.50 per coin)
+    "dca_multiplier": 2.0,  # DCA buy size = current value * this (2.0 => total scales ~3x per DCA)
+    "dca_levels": [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0],  # Hard DCA triggers (percent PnL)
+    "max_dca_buys_per_24h": 2,  # max DCA buys per coin in rolling 24h window (0 disables DCA buys)
+
+    # --- Trailing Profit Margin settings (used by pt_trader.py; shown in GUI settings) ---
+    "pm_start_pct_no_dca": 5.0,
+    "pm_start_pct_with_dca": 2.5,
+    "trailing_gap_pct": 0.5,
+
     "default_timeframe": "1hour",
     "timeframes": [
         "1min", "5min", "15min", "30min",
@@ -288,6 +333,13 @@ DEFAULT_SETTINGS = {
     "script_trader": "pt_trader.py",
     "auto_start_scripts": False,
 }
+
+
+
+
+
+
+
 
 
 
@@ -413,7 +465,7 @@ def _now_str() -> str:
 def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     """
     Mirrors your convention:
-      (Overridden) BTC uses main_dir directly
+      BTC uses main_dir directly
       other coins typically have subfolders inside main_dir (auto-detected)
 
     Returns { "BTC": "...", "ETH": "...", ... }
@@ -421,8 +473,8 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     main_dir = main_dir or os.getcwd()
 
-    # # BTC folder
-    # out["BTC"] = main_dir
+    # BTC folder
+    out["BTC"] = main_dir
 
     # Auto-detect subfolders
     if os.path.isdir(main_dir):
@@ -431,7 +483,7 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
             if not os.path.isdir(p):
                 continue
             sym = name.upper().strip()
-            if sym in coins:
+            if sym in coins and sym != "BTC":
                 out[sym] = p
 
     # Fallbacks for missing ones
@@ -769,7 +821,9 @@ class CandleChart(ttk.Frame):
         current_sell_price: Optional[float] = None,
         trail_line: Optional[float] = None,
         dca_line_price: Optional[float] = None,
+        avg_cost_basis: Optional[float] = None,
     ) -> None:
+
 
 
         cfg = self.settings_getter()
@@ -904,6 +958,13 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
+        # Overlay avg cost basis (yellow)
+        try:
+            if avg_cost_basis is not None and float(avg_cost_basis) > 0:
+                self.ax.axhline(y=float(avg_cost_basis), linewidth=1.5, color="yellow", alpha=0.95)
+        except Exception:
+            pass
+
         # Overlay current ask/bid prices
         try:
             if current_buy_price is not None and float(current_buy_price) > 0:
@@ -917,7 +978,7 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
-        # Right-side price labels (so you can read Bid/Ask/DCA/Sell at a glance)
+        # Right-side price labels (so you can read Bid/Ask/AVG/DCA/Sell at a glance)
         try:
             trans = blended_transform_factory(self.ax.transAxes, self.ax.transData)
             used_y: List[float] = []
@@ -959,15 +1020,16 @@ class CandleChart(ttk.Frame):
                     clip_on=False,
                 )
 
-
-
             # Map to your terminology: Ask=buy line, Bid=sell line
             _label_right(current_buy_price, "ASK", "purple")
             _label_right(current_sell_price, "BID", "teal")
+            _label_right(avg_cost_basis, "AVG", "yellow")
             _label_right(dca_line_price, "DCA", "red")
             _label_right(trail_line, "SELL", "green")
+
         except Exception:
             pass
+
 
 
 
@@ -1265,35 +1327,49 @@ class AccountValueChart(ttk.Frame):
 
 
         # Downsample to <= 250 points by AVERAGING buckets instead of skipping points.
-        # This keeps the chart visually stable when new nearby values arrive.
+        # IMPORTANT: never average the VERY FIRST or VERY LAST point.
+        # - First point should remain the true first historical value.
+        # - Last point should remain the true current/final account value (so the title and chart end match account info).
         max_keep = min(max(2, int(self.max_points or 250)), 250)
         n = len(points)
 
         if n > max_keep:
-            bucket_size = n / float(max_keep)
-            new_points: List[Tuple[float, float]] = []
+            first_pt = points[0]
+            last_pt = points[-1]
 
-            for i in range(max_keep):
-                start = int(i * bucket_size)
-                end = int((i + 1) * bucket_size)
-                if end <= start:
-                    end = start + 1
-                if start >= n:
-                    break
-                if end > n:
-                    end = n
+            mid_points = points[1:-1]
+            mid_n = len(mid_points)
+            keep_mid = max_keep - 2
 
-                bucket = points[start:end]
-                if not bucket:
-                    continue
+            if keep_mid <= 0 or mid_n <= 0:
+                points = [first_pt, last_pt]
+            elif mid_n <= keep_mid:
+                points = [first_pt] + mid_points + [last_pt]
+            else:
+                bucket_size = mid_n / float(keep_mid)
+                new_mid: List[Tuple[float, float]] = []
 
-                # Average timestamp and account value within the bucket
-                avg_ts = sum(p[0] for p in bucket) / len(bucket)
-                avg_val = sum(p[1] for p in bucket) / len(bucket)
+                for i in range(keep_mid):
+                    start = int(i * bucket_size)
+                    end = int((i + 1) * bucket_size)
+                    if end <= start:
+                        end = start + 1
+                    if start >= mid_n:
+                        break
+                    if end > mid_n:
+                        end = mid_n
 
-                new_points.append((avg_ts, avg_val))
+                    bucket = mid_points[start:end]
+                    if not bucket:
+                        continue
 
-            points = new_points
+                    # Average timestamp and account value within the bucket (MID ONLY)
+                    avg_ts = sum(p[0] for p in bucket) / len(bucket)
+                    avg_val = sum(p[1] for p in bucket) / len(bucket)
+                    new_mid.append((avg_ts, avg_val))
+
+                points = [first_pt] + new_mid + [last_pt]
+
 
 
         # clear artists (fast) / fallback to cla()
@@ -1483,6 +1559,14 @@ class PowerTraderHub(tk.Tk):
 
         self.project_dir = os.path.abspath(os.path.dirname(__file__))
 
+        main_dir = str(self.settings.get("main_neural_dir") or "").strip()
+        if main_dir and not os.path.isabs(main_dir):
+            main_dir = os.path.abspath(os.path.join(self.project_dir, main_dir))
+        if (not main_dir) or (not os.path.isdir(main_dir)):
+            main_dir = self.project_dir
+        self.settings["main_neural_dir"] = main_dir
+
+
         # hub data dir
         hub_dir = self.settings.get("hub_data_dir") or os.path.join(self.project_dir, "hub_data")
         self.hub_dir = os.path.abspath(hub_dir)
@@ -1517,7 +1601,7 @@ class PowerTraderHub(tk.Tk):
         self._ensure_alt_coin_folders_and_trainer_on_startup()
 
         # Rebuild folder map after potential folder creation
-        self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+        self.coin_folders = build_coin_folders(self.settings["coin_data_dir"], self.coins)
 
 
         # scripts
@@ -1729,7 +1813,7 @@ class PowerTraderHub(tk.Tk):
                 background=DARK_BG2,
                 foreground=DARK_FG,
                 bordercolor=DARK_BORDER,
-                padding=(2, 2),
+                padding=(10, 6),
             )
             style.map(
                 "ChartTab.TButton",
@@ -1743,7 +1827,7 @@ class PowerTraderHub(tk.Tk):
                 background=DARK_PANEL,
                 foreground=DARK_ACCENT,
                 bordercolor=DARK_ACCENT2,
-                padding=(2, 2),
+                padding=(10, 6),
             )
         except Exception:
             pass
@@ -1796,7 +1880,8 @@ class PowerTraderHub(tk.Tk):
     # ---- settings ----
 
     def _load_settings(self) -> dict:
-        data = _safe_read_json(SETTINGS_FILE)
+        settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
+        data = _safe_read_json(settings_path)
         if not isinstance(data, dict):
             data = {}
 
@@ -1807,7 +1892,9 @@ class PowerTraderHub(tk.Tk):
         return merged
 
     def _save_settings(self) -> None:
-        _safe_write_json(SETTINGS_FILE, self.settings)
+        settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
+        _safe_write_json(settings_path, self.settings)
+
 
     def _settings_getter(self) -> dict:
         return self.settings
@@ -1817,7 +1904,7 @@ class PowerTraderHub(tk.Tk):
         Startup behavior (mirrors Settings-save behavior):
         - For every alt coin in the coin list that does NOT have its folder yet:
             - create the folder
-            - copy neural_trainer.py from the MAIN folder into the new folder
+            - copy neural_trainer.py from the MAIN (BTC) folder into the new folder
         """
         try:
             coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
@@ -1825,7 +1912,7 @@ class PowerTraderHub(tk.Tk):
 
             trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
 
-            # Source trainer: MAIN folder
+            # Source trainer: MAIN folder (BTC folder)
             src_main_trainer = os.path.join(main_dir, trainer_name)
 
             # Best-effort fallback if the main folder doesn't have it (keeps behavior robust)
@@ -1835,7 +1922,7 @@ class PowerTraderHub(tk.Tk):
             for coin in coins:
                 
 
-                coin_dir = os.path.join(main_dir, coin)
+                coin_dir = os.path.join(self.settings.get("coin_data_dir"), coin)
 
                 created = False
                 if not os.path.isdir(coin_dir):
@@ -2020,13 +2107,9 @@ class PowerTraderHub(tk.Tk):
         training_section = ttk.LabelFrame(info_row, text="Training")
         training_section.pack(side="right", fill="both", expand=False, padx=6, pady=6)
 
-        # Hide training_section
-        #training_section.pack_forget()
-
-
         training_left = ttk.Frame(training_section)
         training_left.pack(side="left", fill="both", expand=True)
-        training_left.pack_forget()
+
         # Train coin selector (so you can choose what "Train Selected" targets)
         train_row = ttk.Frame(training_left)
         train_row.pack(fill="x", padx=6, pady=(6, 0))
@@ -2210,7 +2293,7 @@ class PowerTraderHub(tk.Tk):
 
 
         # Account info (LEFT column, under status)
-        acct_box = ttk.LabelFrame(info_row, text="Account")
+        acct_box = ttk.LabelFrame(controls_left, text="Account")
         acct_box.pack(fill="x", padx=6, pady=6)
 
 
@@ -2510,25 +2593,18 @@ class PowerTraderHub(tk.Tk):
         charts_frame = ttk.LabelFrame(right_split, text="Charts (Neural lines overlaid)")
         self._charts_frame = charts_frame
 
-        # Listbox for tabs
-        self.chart_tabs_listbox = tk.Listbox(
-            charts_frame,
-            width=12,
-            exportselection=False,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            selectbackground=DARK_SELECT_BG,
-            selectforeground=DARK_SELECT_FG,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-            activestyle="none",
-        )
-        self.chart_tabs_listbox.pack(side="left", fill="y", padx=(6, 0), pady=6)
+        # Multi-row "tabs" (WrapFrame)
+        self.chart_tabs_bar = WrapFrame(charts_frame)
+        # Keep left padding, remove right padding so tabs can reach the edge
+        self.chart_tabs_bar.pack(fill="x", padx=(6, 0), pady=(6, 0))
 
-        # Page container
+        # Page container (no ttk.Notebook, so there are NO native tabs to show)
         self.chart_pages_container = ttk.Frame(charts_frame)
-        self.chart_pages_container.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        # Keep left padding, remove right padding so charts fill to the edge
+        self.chart_pages_container.pack(fill="both", expand=True, padx=(6, 0), pady=(0, 6))
 
+
+        self._chart_tab_buttons: Dict[str, ttk.Button] = {}
         self.chart_pages: Dict[str, ttk.Frame] = {}
         self._current_chart_page: str = "ACCOUNT"
 
@@ -2545,20 +2621,12 @@ class PowerTraderHub(tk.Tk):
             if f is not None:
                 f.pack(fill="both", expand=True)
 
-            # style selected tab in listbox
-            try:
-                items = list(self.chart_tabs_listbox.get(0, "end"))
-                if name in items:
-                    idx = items.index(name)
-                    # Check if it's already selected to avoid event loops
-                    current_sel = self.chart_tabs_listbox.curselection()
-                    if not current_sel or int(current_sel[0]) != idx:
-                        self.chart_tabs_listbox.selection_clear(0, "end")
-                        self.chart_tabs_listbox.selection_set(idx)
-                        self.chart_tabs_listbox.activate(idx)
-                        self.chart_tabs_listbox.see(idx)
-            except Exception:
-                pass
+            # style selected tab
+            for txt, b in self._chart_tab_buttons.items():
+                try:
+                    b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
+                except Exception:
+                    pass
 
             # Immediately refresh the newly shown coin chart so candles appear right away
             # (even if trader/neural scripts are not running yet).
@@ -2572,10 +2640,10 @@ class PowerTraderHub(tk.Tk):
                             try:
                                 # Ensure coin folders exist (best-effort; fast)
                                 try:
-                                    cf_sig = (self.settings.get("main_neural_dir"), tuple(self.coins))
+                                    cf_sig = (self.settings.get("coin_data_dir"), tuple(self.coins))
                                     if getattr(self, "_coin_folders_sig", None) != cf_sig:
                                         self._coin_folders_sig = cf_sig
-                                        self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                                        self.coin_folders = build_coin_folders(self.settings["coin_data_dir"], self.coins)
                                 except Exception:
                                     pass
 
@@ -2584,6 +2652,7 @@ class PowerTraderHub(tk.Tk):
                                 sell_px = pos.get("current_sell_price", None)
                                 trail_line = pos.get("trail_line", None)
                                 dca_line_price = pos.get("dca_line_price", None)
+                                avg_cost_basis = pos.get("avg_cost_basis", None)
 
                                 chart.refresh(
                                     self.coin_folders,
@@ -2591,7 +2660,9 @@ class PowerTraderHub(tk.Tk):
                                     current_sell_price=sell_px,
                                     trail_line=trail_line,
                                     dca_line_price=dca_line_price,
+                                    avg_cost_basis=avg_cost_basis,
                                 )
+
                             except Exception:
                                 pass
 
@@ -2602,22 +2673,18 @@ class PowerTraderHub(tk.Tk):
 
         self._show_chart_page = _show_page  # used by _rebuild_coin_chart_tabs()
 
-        def _on_tab_select(event=None):
-            try:
-                sel_indices = self.chart_tabs_listbox.curselection()
-                if not sel_indices:
-                    return
-                selected_item = self.chart_tabs_listbox.get(sel_indices[0])
-                self._show_chart_page(selected_item)
-            except Exception:
-                pass
-
-        self.chart_tabs_listbox.bind("<<ListboxSelect>>", _on_tab_select)
-
         # ACCOUNT page
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
-        self.chart_tabs_listbox.insert("end", "ACCOUNT")
+
+        acct_btn = ttk.Button(
+            self.chart_tabs_bar,
+            text="ACCOUNT",
+            style="ChartTab.TButton",
+            command=lambda: self._show_chart_page("ACCOUNT"),
+        )
+        self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
+        self._chart_tab_buttons["ACCOUNT"] = acct_btn
 
         self.account_chart = AccountValueChart(
             acct_page,
@@ -2631,7 +2698,16 @@ class PowerTraderHub(tk.Tk):
         for coin in self.coins:
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
-            self.chart_tabs_listbox.insert("end", coin)
+
+            btn = ttk.Button(
+                self.chart_tabs_bar,
+                text=coin,
+                style="ChartTab.TButton",
+                command=lambda c=coin: self._show_chart_page(c),
+            )
+            self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
+            self._chart_tab_buttons[coin] = btn
+
             chart = CandleChart(page, self.fetcher, coin, self._settings_getter, self.trade_history_path)
             chart.pack(fill="both", expand=True)
             self.charts[coin] = chart
@@ -3245,17 +3321,20 @@ class PowerTraderHub(tk.Tk):
 
         # If an alt coin folder doesn't exist yet, create it and copy the trainer script from the main (BTC) folder.
         # (Also: overwrite to avoid running stale trainer copies in alt folders.)
-        try:
-            if not os.path.isdir(coin_cwd):
-                os.makedirs(coin_cwd, exist_ok=True)
-            src_main_folder = self.project_dir
-            src_trainer_path = os.path.join(src_main_folder, trainer_name)
-            dst_trainer_path = os.path.join(coin_cwd, trainer_name)
 
-            if os.path.isfile(src_trainer_path):
-                shutil.copy2(src_trainer_path, dst_trainer_path)
-        except Exception:
-            pass
+        if coin != "BTC":
+            try:
+                if not os.path.isdir(coin_cwd):
+                    os.makedirs(coin_cwd, exist_ok=True)
+
+                src_main_folder = self.coin_folders.get("BTC", self.project_dir)
+                src_trainer_path = os.path.join(src_main_folder, trainer_name)
+                dst_trainer_path = os.path.join(coin_cwd, trainer_name)
+
+                if os.path.isfile(src_trainer_path):
+                    shutil.copy2(src_trainer_path, dst_trainer_path)
+            except Exception:
+                pass
 
         trainer_path = os.path.join(coin_cwd, trainer_name)
 
@@ -3366,13 +3445,14 @@ class PowerTraderHub(tk.Tk):
             if not coin:
                 return
 
-            self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+            self.coin_folders = build_coin_folders(self.settings["coin_data_dir"], self.coins)
 
             pos = self._last_positions.get(coin, {}) if isinstance(self._last_positions, dict) else {}
             buy_px = pos.get("current_buy_price", None)
             sell_px = pos.get("current_sell_price", None)
             trail_line = pos.get("trail_line", None)
             dca_line_price = pos.get("dca_line_price", None)
+            avg_cost_basis = pos.get("avg_cost_basis", None)
 
             chart.refresh(
                 self.coin_folders,
@@ -3380,12 +3460,14 @@ class PowerTraderHub(tk.Tk):
                 current_sell_price=sell_px,
                 trail_line=trail_line,
                 dca_line_price=dca_line_price,
+                avg_cost_basis=avg_cost_basis,
             )
 
             # Keep the periodic refresh behavior consistent (prevents an immediate full refresh right after this).
             self._last_chart_refresh = time.time()
         except Exception:
             pass
+
 
     # ---- refresh loop ----
     def _drain_queue_to_text(self, q: "queue.Queue[str]", txt: tk.Text, max_lines: int = 2500) -> None:
@@ -3501,13 +3583,13 @@ class PowerTraderHub(tk.Tk):
 
             # Only rebuild coin_folders when inputs change (avoids directory scans every refresh)
             try:
-                cf_sig = (self.settings.get("main_neural_dir"), tuple(self.coins))
+                cf_sig = (self.settings.get("coin_data_dir"), tuple(self.coins))
                 if getattr(self, "_coin_folders_sig", None) != cf_sig:
                     self._coin_folders_sig = cf_sig
-                    self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                    self.coin_folders = build_coin_folders(self.settings["coin_data_dir"], self.coins)
             except Exception:
                 try:
-                    self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                    self.coin_folders = build_coin_folders(self.settings["coin_data_dir"], self.coins)
                 except Exception:
                     pass
 
@@ -3537,6 +3619,8 @@ class PowerTraderHub(tk.Tk):
                     sell_px = pos.get("current_sell_price", None)
                     trail_line = pos.get("trail_line", None)
                     dca_line_price = pos.get("dca_line_price", None)
+                    avg_cost_basis = pos.get("avg_cost_basis", None)
+
                     try:
                         chart.refresh(
                             self.coin_folders,
@@ -3544,9 +3628,11 @@ class PowerTraderHub(tk.Tk):
                             current_sell_price=sell_px,
                             trail_line=trail_line,
                             dca_line_price=dca_line_price,
+                            avg_cost_basis=avg_cost_basis,
                         )
                     except Exception:
                         pass
+
 
 
             self._last_chart_refresh = now
@@ -3621,6 +3707,8 @@ class PowerTraderHub(tk.Tk):
         try:
             total_val = float(acct.get("total_account_value", 0.0) or 0.0)
 
+            self._last_total_account_value = total_val
+
             self.lbl_acct_total_value.config(
                 text=f"Total Account Value: {_fmt_money(acct.get('total_account_value', None))}"
             )
@@ -3638,37 +3726,52 @@ class PowerTraderHub(tk.Tk):
                 pit_txt = "N/A"
             self.lbl_acct_percent_in_trade.config(text=f"Percent In Trade: {pit_txt}")
 
+
             # -------------------------
             # DCA affordability
-            # - Entry allocation mirrors pt_trader.py: total_val * (0.00005 / N) with min $0.50
-            # - Each DCA buy mirrors pt_trader.py: dca_amount = value * 2  (=> total scales ~3x per DCA)
+            # - Entry allocation mirrors pt_trader.py:
+            #     total_val * ((start_allocation_pct/100) / N) with min $0.50
+            # - Each DCA buy mirrors pt_trader.py: dca_amount = value * dca multiplier  (=> total scales ~(1+multiplier)x per DCA)
             # -------------------------
             coins = getattr(self, "coins", None) or []
-            n = len(coins) if len(coins) > 0 else 1
-
+            n = len(coins)
             spread_levels = 0
             single_levels = 0
 
             if total_val > 0.0:
+                alloc_pct = float(self.settings.get("start_allocation_pct", 0.005) or 0.005)
+                if alloc_pct < 0.0:
+                    alloc_pct = 0.0
+                alloc_frac = alloc_pct / 100.0
+
+                dca_mult = float(self.settings.get("dca_multiplier", 2.0) or 2.0)
+                if dca_mult < 0.0:
+                    dca_mult = 0.0
+                dca_factor = 1.0 + dca_mult
+
                 # Spread across all coins
-                alloc_spread = total_val * (0.00005 / n)
+
+                alloc_spread = total_val * alloc_frac
                 if alloc_spread < 0.5:
                     alloc_spread = 0.5
 
                 required = alloc_spread * n  # initial buys for all coins
-                while required > 0.0 and (required * 3.0) <= (total_val + 1e-9):
-                    required *= 3.0
+                while required > 0.0 and (required * dca_factor) <= (total_val + 1e-9):
+                    required *= dca_factor
                     spread_levels += 1
 
+
                 # All DCA into a single coin
-                alloc_single = total_val * 0.00005
+                alloc_single = total_val * alloc_frac
                 if alloc_single < 0.5:
                     alloc_single = 0.5
 
                 required = alloc_single  # initial buy for one coin
-                while required > 0.0 and (required * 3.0) <= (total_val + 1e-9):
-                    required *= 3.0
+                while required > 0.0 and (required * dca_factor) <= (total_val + 1e-9):
+                    required *= dca_factor
                     single_levels += 1
+
+
 
             # Show labels + number (one line each)
             self.lbl_acct_dca_spread.config(text=f"DCA Levels (spread): {spread_levels}")
@@ -3761,6 +3864,31 @@ class PowerTraderHub(tk.Tk):
 
             dca_stages = pos.get("dca_triggered_stages", 0)
             dca_24h = int(dca_24h_by_coin.get(str(coin).upper().strip(), 0))
+
+            # Display + heading reflect the current max DCA setting (hot-reload friendly)
+            try:
+                max_dca_24h = int(float(self.settings.get("max_dca_buys_per_24h", DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2)) or 2))
+            except Exception:
+                max_dca_24h = int(DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2) or 2)
+            if max_dca_24h < 0:
+                max_dca_24h = 0
+            try:
+                self.trades_tree.heading("dca_24h", text=f"DCA 24h (max {max_dca_24h})")
+            except Exception:
+                pass
+            dca_24h_display = f"{dca_24h}/{max_dca_24h}"
+
+
+            # Display + heading reflect trailing PM settings (hot-reload friendly)
+            try:
+                pm0 = float(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0)) or 5.0)
+                pm1 = float(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5)) or 2.5)
+                tg = float(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5)) or 0.5)
+                self.trades_tree.heading("trail_line", text=f"Trail Line (start {pm0:g}/{pm1:g}%, gap {tg:g}%)")
+            except Exception:
+                pass
+
+
             next_dca = pos.get("next_dca_display", "")
 
             trail_line = pos.get("trail_line", 0.0)
@@ -3778,11 +3906,12 @@ class PowerTraderHub(tk.Tk):
                     _fmt_price(sell_price),
                     _fmt_pct(sell_pnl),
                     dca_stages,
-                    dca_24h,
+                    dca_24h_display,
                     next_dca,
                     _fmt_price(trail_line),  # trail line is a price level
                 ),
             )
+
 
 
 
@@ -3898,7 +4027,7 @@ class PowerTraderHub(tk.Tk):
         """
         # Rebuild dependent pieces
         self.coins = [c.upper().strip() for c in (self.settings.get("coins") or []) if c.strip()]
-        self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
+        self.coin_folders = build_coin_folders(self.settings.get("coin_data_dir") or self.project_dir, self.coins)
 
         # Refresh coin dropdowns (they don't auto-update)
         try:
@@ -3962,7 +4091,8 @@ class PowerTraderHub(tk.Tk):
         self.neural_tiles = {}
 
         for coin in (self.coins or []):
-            tile = NeuralSignalTile(self.neural_wrap, coin)
+            tile = NeuralSignalTile(self.neural_wrap, coin, trade_start_level=int(self.settings.get("trade_start_level", 3) or 3))
+
 
             # --- Hover highlighting (real, visible) ---
             def _on_enter(_e=None, t=tile):
@@ -4045,10 +4175,10 @@ class PowerTraderHub(tk.Tk):
 
         # Keep coin_folders aligned with current settings/coins
         try:
-            sig = (str(self.settings.get("main_neural_dir") or ""), tuple(self.coins or []))
+            sig = (str(self.settings.get("coin_data_dir") or ""), tuple(self.coins or []))
             if getattr(self, "_coin_folders_sig", None) != sig:
                 self._coin_folders_sig = sig
-                self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
+                self.coin_folders = build_coin_folders(self.settings.get("coin_data_dir") or self.project_dir, self.coins)
         except Exception:
             pass
 
@@ -4135,7 +4265,7 @@ class PowerTraderHub(tk.Tk):
 
     def _rebuild_coin_chart_tabs(self) -> None:
         """
-        Ensure the Charts listbox tabs + pages match self.coins.
+        Ensure the Charts multi-row tab bar + pages match self.coins.
         Keeps the ACCOUNT page intact and preserves the currently selected page when possible.
         """
         charts_frame = getattr(self, "_charts_frame", None)
@@ -4147,10 +4277,10 @@ class PowerTraderHub(tk.Tk):
         if selected not in (["ACCOUNT"] + list(self.coins)):
             selected = "ACCOUNT"
 
-        # Destroy existing listbox + pages container (clean rebuild)
+        # Destroy existing tab bar + pages container (clean rebuild)
         try:
-            if hasattr(self, "chart_tabs_listbox") and self.chart_tabs_listbox.winfo_exists():
-                self.chart_tabs_listbox.destroy()
+            if hasattr(self, "chart_tabs_bar") and self.chart_tabs_bar.winfo_exists():
+                self.chart_tabs_bar.destroy()
         except Exception:
             pass
 
@@ -4161,23 +4291,13 @@ class PowerTraderHub(tk.Tk):
             pass
 
         # Recreate
-        self.chart_tabs_listbox = tk.Listbox(
-            charts_frame,
-            width=12,
-            exportselection=False,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            selectbackground=DARK_SELECT_BG,
-            selectforeground=DARK_SELECT_FG,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-            activestyle="none",
-        )
-        self.chart_tabs_listbox.pack(side="left", fill="y", padx=(6, 0), pady=6)
+        self.chart_tabs_bar = WrapFrame(charts_frame)
+        self.chart_tabs_bar.pack(fill="x", padx=6, pady=(6, 0))
 
         self.chart_pages_container = ttk.Frame(charts_frame)
-        self.chart_pages_container.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        self.chart_pages_container.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
+        self._chart_tab_buttons = {}
         self.chart_pages = {}
         self._current_chart_page = selected
 
@@ -4192,37 +4312,26 @@ class PowerTraderHub(tk.Tk):
             if f is not None:
                 f.pack(fill="both", expand=True)
 
-            try:
-                items = list(self.chart_tabs_listbox.get(0, "end"))
-                if name in items:
-                    idx = items.index(name)
-                    current_sel = self.chart_tabs_listbox.curselection()
-                    if not current_sel or int(current_sel[0]) != idx:
-                        self.chart_tabs_listbox.selection_clear(0, "end")
-                        self.chart_tabs_listbox.selection_set(idx)
-                        self.chart_tabs_listbox.activate(idx)
-                        self.chart_tabs_listbox.see(idx)
-            except Exception:
-                pass
+            for txt, b in self._chart_tab_buttons.items():
+                try:
+                    b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
+                except Exception:
+                    pass
 
         self._show_chart_page = _show_page
-
-        def _on_tab_select(event=None):
-            try:
-                sel_indices = self.chart_tabs_listbox.curselection()
-                if not sel_indices:
-                    return
-                selected_item = self.chart_tabs_listbox.get(sel_indices[0])
-                self._show_chart_page(selected_item)
-            except Exception:
-                pass
-
-        self.chart_tabs_listbox.bind("<<ListboxSelect>>", _on_tab_select)
 
         # ACCOUNT page
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
-        self.chart_tabs_listbox.insert("end", "ACCOUNT")
+
+        acct_btn = ttk.Button(
+            self.chart_tabs_bar,
+            text="ACCOUNT",
+            style="ChartTab.TButton",
+            command=lambda: self._show_chart_page("ACCOUNT"),
+        )
+        self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
+        self._chart_tab_buttons["ACCOUNT"] = acct_btn
 
         self.account_chart = AccountValueChart(
             acct_page,
@@ -4236,7 +4345,15 @@ class PowerTraderHub(tk.Tk):
         for coin in self.coins:
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
-            self.chart_tabs_listbox.insert("end", coin)
+
+            btn = ttk.Button(
+                self.chart_tabs_bar,
+                text=coin,
+                style="ChartTab.TButton",
+                command=lambda c=coin: self._show_chart_page(c),
+            )
+            self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
+            self._chart_tab_buttons[coin] = btn
 
             chart = CandleChart(page, self.fetcher, coin, self._settings_getter, self.trade_history_path)
             chart.pack(fill="both", expand=True)
@@ -4366,7 +4483,23 @@ class PowerTraderHub(tk.Tk):
 
         main_dir_var = tk.StringVar(value=self.settings["main_neural_dir"])
         coins_var = tk.StringVar(value=",".join(self.settings["coins"]))
+        trade_start_level_var = tk.StringVar(value=str(self.settings.get("trade_start_level", 3)))
+        start_alloc_pct_var = tk.StringVar(value=str(self.settings.get("start_allocation_pct", 0.005)))
+        dca_mult_var = tk.StringVar(value=str(self.settings.get("dca_multiplier", 2.0)))
+        _dca_levels = self.settings.get("dca_levels", DEFAULT_SETTINGS.get("dca_levels", []))
+        if not isinstance(_dca_levels, list):
+            _dca_levels = DEFAULT_SETTINGS.get("dca_levels", [])
+        dca_levels_var = tk.StringVar(value=",".join(str(x) for x in _dca_levels))
+        max_dca_var = tk.StringVar(value=str(self.settings.get("max_dca_buys_per_24h", DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2))))
+
+        # --- Trailing PM settings (editable; hot-reload friendly) ---
+        pm_no_dca_var = tk.StringVar(value=str(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0))))
+        pm_with_dca_var = tk.StringVar(value=str(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5))))
+        trailing_gap_var = tk.StringVar(value=str(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5))))
+
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
+
+
 
         neural_script_var = tk.StringVar(value=self.settings["script_neural_runner2"])
         trainer_script_var = tk.StringVar(value=self.settings.get("script_neural_trainer", "pt_trainer.py"))
@@ -4380,7 +4513,66 @@ class PowerTraderHub(tk.Tk):
         r = 0
         add_row(r, "Main neural folder:", main_dir_var, browse="dir"); r += 1
         add_row(r, "Coins (comma):", coins_var); r += 1
+        add_row(r, "Trade start level (1-7):", trade_start_level_var); r += 1
+
+        # Start allocation % (shows approx $/coin using the last known account value; always displays the $0.50 minimum)
+        ttk.Label(frm, text="Start allocation %:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(frm, textvariable=start_alloc_pct_var).grid(row=r, column=1, sticky="ew", pady=6)
+
+        start_alloc_hint_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=start_alloc_hint_var).grid(row=r, column=2, sticky="w", padx=(10, 0), pady=6)
+
+        def _update_start_alloc_hint(*_):
+            # Parse % (allow "0.01" or "0.01%")
+            try:
+                pct_txt = (start_alloc_pct_var.get() or "").strip().replace("%", "")
+                pct = float(pct_txt) if pct_txt else 0.0
+            except Exception:
+                pct = float(self.settings.get("start_allocation_pct", 0.005) or 0.005)
+
+            if pct < 0.0:
+                pct = 0.0
+
+            # Use the last account value we saw in trader_status.json (no extra API calls).
+            try:
+                total_val = float(getattr(self, "_last_total_account_value", 0.0) or 0.0)
+            except Exception:
+                total_val = 0.0
+
+            coins_list = [c.strip().upper() for c in (coins_var.get() or "").split(",") if c.strip()]
+            n_coins = len(coins_list) if coins_list else 1
+
+            per_coin = 0.0
+            if total_val > 0.0:
+                per_coin = total_val * (pct / 100.0)
+            if per_coin < 0.5:
+                per_coin = 0.5
+
+            if total_val > 0.0:
+                start_alloc_hint_var.set(f"≈ {_fmt_money(per_coin)} per coin (min $0.50)")
+            else:
+                start_alloc_hint_var.set("≈ $0.50 min per coin (needs account value)")
+
+        _update_start_alloc_hint()
+        start_alloc_pct_var.trace_add("write", _update_start_alloc_hint)
+        coins_var.trace_add("write", _update_start_alloc_hint)
+
+        r += 1
+
+        add_row(r, "DCA levels (% list):", dca_levels_var); r += 1
+
+        add_row(r, "DCA multiplier:", dca_mult_var); r += 1
+
+        add_row(r, "Max DCA buys / coin (rolling 24h):", max_dca_var); r += 1
+
+        add_row(r, "Trailing PM start % (no DCA):", pm_no_dca_var); r += 1
+        add_row(r, "Trailing PM start % (with DCA):", pm_with_dca_var); r += 1
+        add_row(r, "Trailing gap % (behind peak):", trailing_gap_var); r += 1
+
         add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
+
+
+
 
         ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
@@ -5004,7 +5196,73 @@ class PowerTraderHub(tk.Tk):
 
                 self.settings["main_neural_dir"] = main_dir_var.get().strip()
                 self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
+                self.settings["trade_start_level"] = max(1, min(int(float(trade_start_level_var.get().strip())), 7))
+
+                sap = (start_alloc_pct_var.get() or "").strip().replace("%", "")
+                self.settings["start_allocation_pct"] = max(0.0, float(sap or 0.0))
+
+                dm = (dca_mult_var.get() or "").strip()
+                try:
+                    dm_f = float(dm)
+                except Exception:
+                    dm_f = float(self.settings.get("dca_multiplier", DEFAULT_SETTINGS.get("dca_multiplier", 2.0)) or 2.0)
+                if dm_f < 0.0:
+                    dm_f = 0.0
+                self.settings["dca_multiplier"] = dm_f
+
+                raw_dca = (dca_levels_var.get() or "").replace(",", " ").split()
+                dca_levels = []
+                for tok in raw_dca:
+                    try:
+                        dca_levels.append(float(tok))
+                    except Exception:
+                        pass
+                if not dca_levels:
+                    dca_levels = list(DEFAULT_SETTINGS.get("dca_levels", []))
+                self.settings["dca_levels"] = dca_levels
+
+                md = (max_dca_var.get() or "").strip()
+                try:
+                    md_i = int(float(md))
+                except Exception:
+                    md_i = int(self.settings.get("max_dca_buys_per_24h", DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2)) or 2)
+                if md_i < 0:
+                    md_i = 0
+                self.settings["max_dca_buys_per_24h"] = md_i
+
+
+                # --- Trailing PM settings ---
+                try:
+                    pm0 = float((pm_no_dca_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    pm0 = float(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0)) or 5.0)
+                if pm0 < 0.0:
+                    pm0 = 0.0
+                self.settings["pm_start_pct_no_dca"] = pm0
+
+                try:
+                    pm1 = float((pm_with_dca_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    pm1 = float(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5)) or 2.5)
+                if pm1 < 0.0:
+                    pm1 = 0.0
+                self.settings["pm_start_pct_with_dca"] = pm1
+
+                try:
+                    tg = float((trailing_gap_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    tg = float(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5)) or 0.5)
+                if tg < 0.0:
+                    tg = 0.0
+                self.settings["trailing_gap_pct"] = tg
+
+
+
                 self.settings["hub_data_dir"] = hub_dir_var.get().strip()
+
+
+
+
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
                 self.settings["script_trader"] = trader_script_var.get().strip()
@@ -5025,13 +5283,14 @@ class PowerTraderHub(tk.Tk):
                     trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
 
                     # Best-effort resolve source trainer path:
-                    # Prefer trainer living in the main folder; fallback to the configured trainer path.
+                    # Prefer trainer living in the main (BTC) folder; fallback to the configured trainer path.
                     src_main_trainer = os.path.join(main_dir, trainer_name)
                     src_cfg_trainer = str(self.settings.get("script_neural_trainer", trainer_name))
                     src_trainer_path = src_main_trainer if os.path.isfile(src_main_trainer) else src_cfg_trainer
 
                     for coin in added:
-                        coin_dir = os.path.join(main_dir, coin)
+
+                        coin_dir = os.path.join(self.settings.get("coin_data_dir"), coin)
                         if not os.path.isdir(coin_dir):
                             os.makedirs(coin_dir, exist_ok=True)
 

@@ -92,6 +92,16 @@ _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
 	"main_neural_dir": None,
+    "trade_start_level": 3,
+	"start_allocation_pct": 0.005,
+	"dca_multiplier": 2.0,
+	"dca_levels": [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0],
+	"max_dca_buys_per_24h": 2,
+
+	# Trailing PM settings (defaults match previous hardcoded behavior)
+	"pm_start_pct_no_dca": 5.0,
+	"pm_start_pct_with_dca": 2.5,
+	"trailing_gap_pct": 0.5,
 }
 
 def _load_gui_settings() -> dict:
