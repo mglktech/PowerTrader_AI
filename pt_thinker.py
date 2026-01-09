@@ -176,11 +176,11 @@ COIN_SYMBOLS = _load_gui_coins()
 CURRENT_COINS = list(COIN_SYMBOLS)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
+COIN_DATA_DIR = "coin_data"
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
-	# Your "main folder is BTC folder" convention:
-	return os.path.join(BASE_DIR, sym)
+	# (Overidden) Your "main folder is BTC folder" convention:
+	return os.path.join(BASE_DIR,COIN_DATA_DIR, sym)
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---

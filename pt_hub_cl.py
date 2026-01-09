@@ -465,7 +465,7 @@ def _now_str() -> str:
 def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     """
     Mirrors your convention:
-      BTC uses main_dir directly
+      (Overridden) BTC uses main_dir directly
       other coins typically have subfolders inside main_dir (auto-detected)
 
     Returns { "BTC": "...", "ETH": "...", ... }
@@ -474,7 +474,7 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     main_dir = main_dir or os.getcwd()
 
     # BTC folder
-    out["BTC"] = main_dir
+    #out["BTC"] = main_dir
 
     # Auto-detect subfolders
     if os.path.isdir(main_dir):
@@ -483,7 +483,8 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
             if not os.path.isdir(p):
                 continue
             sym = name.upper().strip()
-            if sym in coins and sym != "BTC":
+            #if sym in coins and sym != "BTC":
+            if sym in coins:
                 out[sym] = p
 
     # Fallbacks for missing ones
@@ -2592,11 +2593,20 @@ class PowerTraderHub(tk.Tk):
         # ----------------------------
         charts_frame = ttk.LabelFrame(right_split, text="Charts (Neural lines overlaid)")
         self._charts_frame = charts_frame
-
-        # Multi-row "tabs" (WrapFrame)
-        self.chart_tabs_bar = WrapFrame(charts_frame)
-        # Keep left padding, remove right padding so tabs can reach the edge
-        self.chart_tabs_bar.pack(fill="x", padx=(6, 0), pady=(6, 0))
+          # Listbox for tabs
+        self.chart_tabs_listbox = tk.Listbox(
+            charts_frame,
+            width=12,
+            exportselection=False,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            selectbackground=DARK_SELECT_BG,
+            selectforeground=DARK_SELECT_FG,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+            activestyle="none",
+        )
+        self.chart_tabs_listbox.pack(side="left", fill="y", padx=(6, 0), pady=6)
 
         # Page container (no ttk.Notebook, so there are NO native tabs to show)
         self.chart_pages_container = ttk.Frame(charts_frame)
@@ -2621,12 +2631,20 @@ class PowerTraderHub(tk.Tk):
             if f is not None:
                 f.pack(fill="both", expand=True)
 
-            # style selected tab
-            for txt, b in self._chart_tab_buttons.items():
-                try:
-                    b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
-                except Exception:
-                    pass
+            # style selected tab in listbox
+            try:
+                items = list(self.chart_tabs_listbox.get(0, "end"))
+                if name in items:
+                    idx = items.index(name)
+                    # Check if it's already selected to avoid event loops
+                    current_sel = self.chart_tabs_listbox.curselection()
+                    if not current_sel or int(current_sel[0]) != idx:
+                        self.chart_tabs_listbox.selection_clear(0, "end")
+                        self.chart_tabs_listbox.selection_set(idx)
+                        self.chart_tabs_listbox.activate(idx)
+                        self.chart_tabs_listbox.see(idx)
+            except Exception:
+                pass
 
             # Immediately refresh the newly shown coin chart so candles appear right away
             # (even if trader/neural scripts are not running yet).
@@ -2673,18 +2691,30 @@ class PowerTraderHub(tk.Tk):
 
         self._show_chart_page = _show_page  # used by _rebuild_coin_chart_tabs()
 
+        def _on_tab_select(event=None):
+            try:
+                sel_indices = self.chart_tabs_listbox.curselection()
+                if not sel_indices:
+                    return
+                selected_item = self.chart_tabs_listbox.get(sel_indices[0])
+                self._show_chart_page(selected_item)
+            except Exception:
+                pass
+
+        self.chart_tabs_listbox.bind("<<ListboxSelect>>", _on_tab_select)
+
         # ACCOUNT page
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
-
-        acct_btn = ttk.Button(
-            self.chart_tabs_bar,
-            text="ACCOUNT",
-            style="ChartTab.TButton",
-            command=lambda: self._show_chart_page("ACCOUNT"),
-        )
-        self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
-        self._chart_tab_buttons["ACCOUNT"] = acct_btn
+        self.chart_tabs_listbox.insert("end", "ACCOUNT")
+        # acct_btn = ttk.Button(
+        #     self.chart_tabs_bar,
+        #     text="ACCOUNT",
+        #     style="ChartTab.TButton",
+        #     command=lambda: self._show_chart_page("ACCOUNT"),
+        # )
+        # self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
+        # self._chart_tab_buttons["ACCOUNT"] = acct_btn
 
         self.account_chart = AccountValueChart(
             acct_page,
@@ -2698,16 +2728,7 @@ class PowerTraderHub(tk.Tk):
         for coin in self.coins:
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
-
-            btn = ttk.Button(
-                self.chart_tabs_bar,
-                text=coin,
-                style="ChartTab.TButton",
-                command=lambda c=coin: self._show_chart_page(c),
-            )
-            self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
-            self._chart_tab_buttons[coin] = btn
-
+            self.chart_tabs_listbox.insert("end", coin)
             chart = CandleChart(page, self.fetcher, coin, self._settings_getter, self.trade_history_path)
             chart.pack(fill="both", expand=True)
             self.charts[coin] = chart
@@ -3312,7 +3333,7 @@ class PowerTraderHub(tk.Tk):
 
         # --- IMPORTANT ---
         # Match the trader's folder convention:
-        #   BTC runs from the main neural folder
+        # (Overridden)  BTC runs from the main neural folder
         #   Alts run from their own coin subfolder
         coin_cwd = self.coin_folders.get(coin, self.project_dir)
 
@@ -3322,19 +3343,19 @@ class PowerTraderHub(tk.Tk):
         # If an alt coin folder doesn't exist yet, create it and copy the trainer script from the main (BTC) folder.
         # (Also: overwrite to avoid running stale trainer copies in alt folders.)
 
-        if coin != "BTC":
-            try:
-                if not os.path.isdir(coin_cwd):
-                    os.makedirs(coin_cwd, exist_ok=True)
+        
+        try:
+            if not os.path.isdir(coin_cwd):
+                os.makedirs(coin_cwd, exist_ok=True)
 
-                src_main_folder = self.coin_folders.get("BTC", self.project_dir)
-                src_trainer_path = os.path.join(src_main_folder, trainer_name)
-                dst_trainer_path = os.path.join(coin_cwd, trainer_name)
+            src_main_folder = self.project_dir
+            src_trainer_path = os.path.join(src_main_folder, trainer_name)
+            dst_trainer_path = os.path.join(coin_cwd, trainer_name)
 
-                if os.path.isfile(src_trainer_path):
-                    shutil.copy2(src_trainer_path, dst_trainer_path)
-            except Exception:
-                pass
+            if os.path.isfile(src_trainer_path):
+                shutil.copy2(src_trainer_path, dst_trainer_path)
+        except Exception:
+            pass
 
         trainer_path = os.path.join(coin_cwd, trainer_name)
 
@@ -4265,7 +4286,7 @@ class PowerTraderHub(tk.Tk):
 
     def _rebuild_coin_chart_tabs(self) -> None:
         """
-        Ensure the Charts multi-row tab bar + pages match self.coins.
+        Ensure the Charts listbox tabs + pages match self.coins.
         Keeps the ACCOUNT page intact and preserves the currently selected page when possible.
         """
         charts_frame = getattr(self, "_charts_frame", None)
@@ -4277,10 +4298,10 @@ class PowerTraderHub(tk.Tk):
         if selected not in (["ACCOUNT"] + list(self.coins)):
             selected = "ACCOUNT"
 
-        # Destroy existing tab bar + pages container (clean rebuild)
+        # Destroy existing listbox + pages container (clean rebuild)
         try:
-            if hasattr(self, "chart_tabs_bar") and self.chart_tabs_bar.winfo_exists():
-                self.chart_tabs_bar.destroy()
+            if hasattr(self, "chart_tabs_listbox") and self.chart_tabs_listbox.winfo_exists():
+                self.chart_tabs_listbox.destroy()
         except Exception:
             pass
 
@@ -4291,13 +4312,23 @@ class PowerTraderHub(tk.Tk):
             pass
 
         # Recreate
-        self.chart_tabs_bar = WrapFrame(charts_frame)
-        self.chart_tabs_bar.pack(fill="x", padx=6, pady=(6, 0))
+        self.chart_tabs_listbox = tk.Listbox(
+            charts_frame,
+            width=12,
+            exportselection=False,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            selectbackground=DARK_SELECT_BG,
+            selectforeground=DARK_SELECT_FG,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+            activestyle="none",
+        )
+        self.chart_tabs_listbox.pack(side="left", fill="y", padx=(6, 0), pady=6)
 
         self.chart_pages_container = ttk.Frame(charts_frame)
-        self.chart_pages_container.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.chart_pages_container.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
 
-        self._chart_tab_buttons = {}
         self.chart_pages = {}
         self._current_chart_page = selected
 
@@ -4312,26 +4343,37 @@ class PowerTraderHub(tk.Tk):
             if f is not None:
                 f.pack(fill="both", expand=True)
 
-            for txt, b in self._chart_tab_buttons.items():
-                try:
-                    b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
-                except Exception:
-                    pass
+            try:
+                items = list(self.chart_tabs_listbox.get(0, "end"))
+                if name in items:
+                    idx = items.index(name)
+                    current_sel = self.chart_tabs_listbox.curselection()
+                    if not current_sel or int(current_sel[0]) != idx:
+                        self.chart_tabs_listbox.selection_clear(0, "end")
+                        self.chart_tabs_listbox.selection_set(idx)
+                        self.chart_tabs_listbox.activate(idx)
+                        self.chart_tabs_listbox.see(idx)
+            except Exception:
+                pass
 
         self._show_chart_page = _show_page
+
+        def _on_tab_select(event=None):
+            try:
+                sel_indices = self.chart_tabs_listbox.curselection()
+                if not sel_indices:
+                    return
+                selected_item = self.chart_tabs_listbox.get(sel_indices[0])
+                self._show_chart_page(selected_item)
+            except Exception:
+                pass
+
+        self.chart_tabs_listbox.bind("<<ListboxSelect>>", _on_tab_select)
 
         # ACCOUNT page
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
-
-        acct_btn = ttk.Button(
-            self.chart_tabs_bar,
-            text="ACCOUNT",
-            style="ChartTab.TButton",
-            command=lambda: self._show_chart_page("ACCOUNT"),
-        )
-        self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
-        self._chart_tab_buttons["ACCOUNT"] = acct_btn
+        self.chart_tabs_listbox.insert("end", "ACCOUNT")
 
         self.account_chart = AccountValueChart(
             acct_page,
@@ -4345,15 +4387,7 @@ class PowerTraderHub(tk.Tk):
         for coin in self.coins:
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
-
-            btn = ttk.Button(
-                self.chart_tabs_bar,
-                text=coin,
-                style="ChartTab.TButton",
-                command=lambda c=coin: self._show_chart_page(c),
-            )
-            self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
-            self._chart_tab_buttons[coin] = btn
+            self.chart_tabs_listbox.insert("end", coin)
 
             chart = CandleChart(page, self.fetcher, coin, self._settings_getter, self.trade_history_path)
             chart.pack(fill="both", expand=True)
@@ -4361,7 +4395,6 @@ class PowerTraderHub(tk.Tk):
 
         # Restore selection
         self._show_chart_page(selected)
-
 
 
 

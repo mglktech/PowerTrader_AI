@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from kucoin.client import Market
 import random
 
+BASE_DATA_DIR = "coin_data"
 # -----------------------------
 # KuCoin Market Data with Fluctuation
 # -----------------------------
@@ -1187,7 +1188,7 @@ class CryptoAPITrading:
 
                 if trail_line_disp > 0:
                     dist_to_trail_pct = ((current_sell_price - trail_line_disp) / trail_line_disp) * 100.0
-            file = open(symbol+'_current_price.txt', 'w+')
+            file = open(os.path.join(BASE_DATA_DIR,f'{symbol}_current_price.txt'), 'w+')
             file.write(str(current_buy_price))
             file.close()
             positions[symbol] = {
@@ -1406,7 +1407,7 @@ class CryptoAPITrading:
 
                 # keep the per-coin current price file behavior for consistency
                 try:
-                    file = open(sym + '_current_price.txt', 'w+')
+                    file = open(os.path.join(BASE_DATA_DIR,f'{symbol}_current_price.txt'), 'w+')
                     file.write(str(current_buy_price))
                     file.close()
                 except Exception:
